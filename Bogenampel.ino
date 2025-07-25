@@ -11,6 +11,7 @@
 #include <vector>  // NEU: Für die Liste der zu löschenden Peers
 #include <array>   // NEU: Für die MAC-Adressen in der Liste
 #include <Button2.h> // Button2 Bibliothek hinzufügen
+#include <ESP32Encoder.h> // NEU: Bibliothek für den KY-040 Drehgeber
 
 // Definition des Ampelzustands
 enum State { ROT, GELB_PREP, GRUEN, GELB_REST };
@@ -63,7 +64,14 @@ public:
 };
 
 // Definition von Ton-Typen für die NRF Kommunikation und Steuerung
-enum ToneType { TONE_NONE, TONE_START_PASSE, TONE_GRUEN_GO, TONE_END_AB, TONE_END_CD, TONE_END_STANDARD, TONE_EMERGENCY }; // TONE_EMERGENCY hinzugefügt
+enum ToneType {
+  TONE_NONE,
+  TONE_GO_TO_LINE,    // Zweimaliges Pfeifen: Zur Schießlinie gehen (Regel 6.7.2.1, 1. Punkt)
+  TONE_SHOOT_START,   // Einmaliges Pfeifen: Schießbeginn (Regel 6.7.2.1, 2. und 5. Punkt)
+  TONE_GROUP_CHANGE,  // Zweimaliges Pfeifen: Schießzeit beendet, Gruppenwechsel (Regel 6.7.2.1, 3. Punkt)
+  TONE_END_OF_END,    // Dreimaliges Pfeifen: Schießzeit beendet, Trefferaufnahme (Regel 6.7.2.1, 6. Punkt)
+  TONE_EMERGENCY      // Reihe aufeinanderfolgender Pfiffe: Gefahr (Regel 6.7.2.1, 7. Punkt)
+};
 
 // Definition der LED-Pins
 const int redLedPin = 2;
@@ -75,10 +83,12 @@ const int cdLedPin = 5;  // Zusätzliche LED für CD Gruppe
 // Definition des Piezo-Summer Pins
 const int piezoPin = 18;
 
-// Definition der Joystick-Pins
-const int joystickUpPin = 19;
-const int joystickDownPin = 27; // Geändert von 35 auf 27 (unterstützt INPUT_PULLUP)
-const int joystickSelectPin = 32;
+// NEU: Definition der KY-040 Drehgeber-Pins
+const int ENCODER_CLK_PIN = 19; // CLK-Pin des Encoders
+const int ENCODER_DT_PIN = 27;  // DT-Pin des Encoders
+const int ENCODER_SW_PIN = 32;  // SW-Pin (Taster) des Encoders
+// NEU: Variable zum Speichern des letzten Encoder-Zustands
+long oldEncoderValue = 0;
 
 // Definition der zusätzlichen Taster-Pins
 const int startStopButtonPin = 25; // Pin für Start/Stop Taster
@@ -156,10 +166,12 @@ bool connectionOk = false; // Status der Verbindung (startet als nicht OK)
 
 // Menü-Zustand
 bool inMenu = false;
-const char* menuItems[] = {"Schiesszeit", "Zielmodus", "Rolle", "Web Log"};
-const char* shootingTimeOptions[] = {"3 Pfeile", "6 Pfeile"};
-const char* targetModes[] = {"Standard", "AB/CD"};
-const char* roleModes[] = {"Master", "Slave"};
+// NEU: "Zurueck" als letzter Menüpunkt
+const char* menuItems[] = {"Schiesszeit", "Zielmodus", "Rolle", "Web Log", PSTR("Zurueck")};
+// NEU: "Zurueck" als letzte Option in den Untermenüs
+const char* shootingTimeOptions[] = {"3 Pfeile", "6 Pfeile", PSTR("Zurueck")};
+const char* targetModes[] = {"Standard", "AB/CD", PSTR("Zurueck")};
+const char* roleModes[] = {"Master", "Slave", PSTR("Zurueck")};
 int currentMenuItem = 0;
 int currentShootingTimeIndex = 0; // Index für Schießzeit 3/6 Pfeile
 bool inSelectionMode = false; // NEU: Flag für Auswahlmodus
@@ -205,16 +217,13 @@ WebServer server(80);
 // NEU: Globales Objekt für Serial Logging (Web und Hardware)
 SerialAndWebLogger WebSerial(Serial);
 
-// Button2 Objekte erstellen
-Button2 buttonJoystickSelect(joystickSelectPin);
-Button2 buttonJoystickUp(joystickUpPin);
-Button2 buttonJoystickDown(joystickDownPin);
+// NEU: Encoder- und Button2-Objekte erstellen
+ESP32Encoder encoder; // Das Encoder-Objekt
+Button2 buttonEncoderSwitch(ENCODER_SW_PIN); // Taster des Encoders
 Button2 buttonStartStop(startStopButtonPin);
 Button2 buttonEmergency(emergencyButtonPin);
 
-void handleJoystickSelectPressed(Button2& btn);
-void handleJoystickUpPressed(Button2& btn);
-void handleJoystickDownPressed(Button2& btn);
+void handleEncoderSwitchPressed(Button2& btn); // Umbenannt für Klarheit
 void handleStartStopPressed(Button2& btn);
 void handleEmergencyPressed(Button2& btn);
 
@@ -234,7 +243,7 @@ void handleSetSchiesszeit(); // Webserver-Handler zum Setzen der Schießzeit
 void handleSetZielmodus(); // Webserver-Handler zum Setzen des Zielmodus
 void handleSetRolle(); // Webserver-Handler zum Setzen der Rolle
 void handleNotFound(); // Webserver-Handler für unbekannte URLs
-void handleWebReset(); // NEU: Handler zum Zurücksetzen der Ampel/Serie
+void handleWebReset(); // NEU: Handler zum Zuruecksetzen der Ampel/Serie
 void triggerEmergencyStop(); // NEU: Funktion für Notstopp-Aktionen
 void handleEmergencyStop(); // NEU: Web-Handler für Notstopp
 void handleOtaUpdatePage(); // NEU: Handler für die GET /update Seite
@@ -363,11 +372,16 @@ void setup() {
   pinMode(abLedPin, OUTPUT);
   pinMode(cdLedPin, OUTPUT);
 
+  // NEU: KY-040 Encoder initialisieren
+  // ESP32Encoder::useInternalWeakPullResistors = NONE; // Interne Pull-ups für CLK/DT aktivieren
+  encoder.attachHalfQuad(ENCODER_CLK_PIN, ENCODER_DT_PIN);
+  encoder.clearCount(); // Zähler auf 0 setzen
+  WebSerial.println(F("KY-040 Encoder initialisiert."));
+
   // Setze den Piezo-Pin als Ausgang
   pinMode(piezoPin, OUTPUT);
   digitalWrite(piezoPin, LOW); // Stelle sicher, dass der Summer stumm ist
 
-  // --- NRF24L01+ Initialisierung entfernt ---
 
   // Initialisiere das U8g2 Display
   Wire.begin(); // Starte I2C
@@ -414,7 +428,7 @@ void setup() {
 
   // ESP-NOW initialisieren
   // Versuch, ESP-NOW zuerst zu deinitialisieren, falls es in einem inkonsistenten Zustand ist.
-  // esp_now_deinit() gibt ESP_ERR_ESPNOW_NOT_INIT zurück, wenn ESP-NOW nicht initialisiert war,
+  // esp_now_deinit() gibt ESP_ERR_ESPNOW_NOT_INIT Zurueck, wenn ESP-NOW nicht initialisiert war,
   // was in diesem Fall in Ordnung ist und ignoriert werden kann.
   esp_now_deinit(); 
   if (esp_now_init() != ESP_OK) {
@@ -450,7 +464,7 @@ void setup() {
   });
   ArduinoOTA.onEnd([]() {
     WebSerial.println(F("\nOTA Update beendet"));
-    isOtaRunning = false; // Setze das OTA-Running-Flag zurück
+    isOtaRunning = false; // Setze das OTA-Running-Flag Zurueck
     // Nach dem Update wird das Gerät normalerweise neu gestartet
     // ESP.restart(); // Wird normalerweise vom OTA Prozess gemacht
   });
@@ -471,7 +485,7 @@ void setup() {
     else if (error == OTA_RECEIVE_ERROR) WebSerial.println(F("Empfangsfehler"));
     else if (error == OTA_END_ERROR) WebSerial.println(F("Fehler beim Beenden"));
     otaTimedOut = true; // Setze das Timeout-Flag bei einem Fehler
-    isOtaRunning = false; // Setze das OTA-Running-Flag zurück
+    isOtaRunning = false; // Setze das OTA-Running-Flag Zurueck
     // Optional: Fehler auf Display anzeigen
      u8g2.clearBuffer();
      u8g2.setFont(u8g2_font_5x8_tf); // Kleinere Schriftart (Alternative)
@@ -524,10 +538,8 @@ void setup() {
   // Callback für empfangene Daten registrieren (NACH dem ersten setState, um sicherzustellen, dass der Slave bereit ist)
   esp_now_register_recv_cb(OnDataRecv);
 
-    // Button2 Handler initialisieren
-  buttonJoystickSelect.setPressedHandler(handleJoystickSelectPressed);
-  buttonJoystickUp.setPressedHandler(handleJoystickUpPressed);
-  buttonJoystickDown.setPressedHandler(handleJoystickDownPressed);
+// Button2 Handler initialisieren
+  buttonEncoderSwitch.setPressedHandler(handleEncoderSwitchPressed); // Umbenannter Handler
   buttonStartStop.setPressedHandler(handleStartStopPressed);
   buttonEmergency.setPressedHandler(handleEmergencyPressed);
 }
@@ -537,11 +549,48 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
 
+  // NEU: Logik zum Auslesen des KY-040 Drehgebers
+  if (inMenu) { // Den Encoder nur auswerten, wenn wir im Menü sind
+    long newEncoderValue = encoder.getCount();
+
+    if (newEncoderValue != oldEncoderValue) {
+      if (newEncoderValue > oldEncoderValue) {
+        // Encoder wurde im Uhrzeigersinn gedreht (entspricht "Runter")
+        WebSerial.println(F("Encoder: Runter gedreht."));
+        if (!inSelectionMode) { // Im Hauptmenü navigieren
+            currentMenuItem = (currentMenuItem < (sizeof(menuItems) / sizeof(menuItems[0]) - 1)) ? currentMenuItem + 1 : 0; 
+        } else { // Im Auswahlmodus navigieren
+            int numOptions = 0;
+            if (selectionMenuItem == 0) numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]); 
+            else if (selectionMenuItem == 1) numOptions = sizeof(targetModes) / sizeof(targetModes[0]); 
+            else if (selectionMenuItem == 2) numOptions = sizeof(roleModes) / sizeof(roleModes[0]); 
+            currentSelectionIndex = (currentSelectionIndex < numOptions - 1) ? currentSelectionIndex + 1 : 0; 
+        }
+        drawMenu(); // Menü neu zeichnen
+      } else {
+        // Encoder wurde gegen den Uhrzeigersinn gedreht (entspricht "Hoch")
+        WebSerial.println(F("Encoder: Hoch gedreht."));
+        if (!inSelectionMode) { // Im Hauptmenü navigieren
+            currentMenuItem = (currentMenuItem > 0) ? currentMenuItem - 1 : (sizeof(menuItems) / sizeof(menuItems[0]) - 1); 
+        } else { // Im Auswahlmodus navigieren
+            int numOptions = 0;
+            if (selectionMenuItem == 0) numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]); 
+            else if (selectionMenuItem == 1) numOptions = sizeof(targetModes) / sizeof(targetModes[0]); 
+            else if (selectionMenuItem == 2) numOptions = sizeof(roleModes) / sizeof(roleModes[0]); 
+            currentSelectionIndex = (currentSelectionIndex > 0) ? currentSelectionIndex - 1 : numOptions - 1; 
+        }
+        drawMenu(); // Menü neu zeichnen
+      }
+      oldEncoderValue = newEncoderValue; // Neuen Wert als alten speichern
+      encoder.clearCount(); // Zähler Zuruecksetzen, um Überlauf zu vermeiden und relative Bewegung zu nutzen
+      oldEncoderValue = 0;
+    }
+  }
   // OTA Timeout Überprüfung
   if (isOtaRunning && (millis() - otaStartTime > otaTimeout) && !otaTimedOut) {
      WebSerial.println(F("OTA Timeout erreicht."));
      otaTimedOut = true; // Markiere als getimeoutet
-     isOtaRunning = false; // Setze Flag zurück (oder lass OTAErrorHandler das machen)
+     isOtaRunning = false; // Setze Flag Zurueck (oder lass OTAErrorHandler das machen)
      // Der OTA onError Handler macht bereits Display-Update und setzt isOtaRunning/otaTimedOut.
   }
 
@@ -561,7 +610,7 @@ void loop() {
            for (int i = 0; i < numRegisteredSlaves; ++i) { // Sende nur an die tatsächlich registrierten
               esp_now_send(slaveMacs[i], (uint8_t *) &pingMsg, sizeof(pingMsg));
            }
-           // Nach dem Senden eines Pings den Pong-Timer nicht sofort zurücksetzen,
+           // Nach dem Senden eines Pings den Pong-Timer nicht sofort Zuruecksetzen,
            // sondern auf die Antwort warten.
         }
         // Master: Verbindung prüfen (Timeout seit letztem PONG)
@@ -594,9 +643,7 @@ void loop() {
 
   // --- Button2 Loop Aufrufe ---
   // Diese müssen regelmäßig aufgerufen werden, damit die Button2 Bibliothek die Tasterzustände prüfen kann
-  buttonJoystickSelect.loop();
-  buttonJoystickUp.loop();
-  buttonJoystickDown.loop();
+  buttonEncoderSwitch.loop();
   buttonStartStop.loop();
   buttonEmergency.loop();
 
@@ -609,7 +656,7 @@ void triggerEmergencyStop() {
     WebSerial.println(F("!!! TRIGGERING EMERGENCY STOP !!!"));
     // Sofortige Aktionen (Master & Slave)
     currentState = ROT; // Sofort auf ROT
-    abCdPhase = 0;      // Sequenz zurücksetzen
+    abCdPhase = 0;      // Sequenz Zuruecksetzen
     isStartingGroupAB = true;
     startTime = millis(); // Timer neu starten für ROT
     // Sofort Notsignal spielen (blockierend)
@@ -628,7 +675,7 @@ void processTrafficLightState() {
   if (!isMaster) return;
 
   unsigned long currentTime = millis();
-  unsigned long elapsedTime = currentTime - startTime; // Zeit seit dem letzten Zustandswechsel
+  unsigned long elapsedTime = currentTime - startTime; // Zeit seit dem letzten Zustandswechsels
 
   // --- Manuelle Stop-Logik (konsolidiert) ---
   // Prüfen, ob ein manueller Stopp ausgelöst wurde, während die Ampel aktiv ist
@@ -643,28 +690,35 @@ void processTrafficLightState() {
       // Bestimme den korrekten End-Ton und ob das End vorbei ist
       if (targetMode == targetModes[1]) { // "AB/CD"
           if (finishedPhase == 0) { // AB wurde unterbrochen
-              toneToPlay = TONE_END_AB; // Doppelton
               if (!isStartingGroupAB) { isEndOfEnd = true; } // Wenn CD gestartet hat, ist das End jetzt vorbei
           } else { // CD wurde unterbrochen
-              toneToPlay = TONE_END_CD; // Dreifachton
               if (isStartingGroupAB) { isEndOfEnd = true; } // Wenn AB gestartet hat, ist das End jetzt vorbei
           }
+          // Ton spielen basierend auf isEndOfEnd
+          if (isEndOfEnd) {
+              toneToPlay = TONE_END_OF_END; // Dreimaliges Signal für das Ende eines AB/CD Endes
+          } else {
+              toneToPlay = TONE_GROUP_CHANGE; // Zweimaliges Signal für Gruppenwechsel
+          }
+
       } else { // Standard Modus unterbrochen
-          toneToPlay = TONE_END_STANDARD; // Dreifachton
+          toneToPlay = TONE_END_OF_END; // Dreifachton
           isEndOfEnd = true; // Im Standard Modus ist es immer das Ende des Ends
       }
 
-      // Spiele den ermittelten Ton (blockierend)
+      // Spielen des ermittelten Tons (blockierend)
       noTone(piezoPin);
       switch(toneToPlay) {
-           case TONE_END_AB:
+            case TONE_END_OF_END:           // Dreimaliges Pfeifen: Schießzeit beendet, Trefferaufnahme
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
+                break;
+            case TONE_GROUP_CHANGE: // Zweimaliges Pfeifen
                tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
-               break;
-           case TONE_END_CD:
-           case TONE_END_STANDARD:
-               tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
-               break;
-           default: break; // Sollte nicht vorkommen
+                break;
+            case TONE_NONE:
+               // Kein Ton
+                break;
+           default: break; // Sollte mit dieser Logik nicht vorkommen
       }
 
       // Aktualisiere Phase/Startgruppe für den *nächsten* Durchgang
@@ -686,7 +740,7 @@ void processTrafficLightState() {
       }
 
       // Gehe zu ROT, Ton wurde bereits gespielt
-      setState(ROT, TONE_NONE);
+      setState(ROT, TONE_NONE); // Ton wurde schon oben gespielt, hier TONE_NONE senden
 
       // Wichtig: Verlasse die Funktion hier, damit die switch-Anweisung nicht mehr ausgeführt wird
       return;
@@ -701,7 +755,7 @@ void processTrafficLightState() {
         WebSerial.print(F("DEBUG (ROT->Start): Aktuelle abCdPhase=")); WebSerial.print(abCdPhase);
         WebSerial.print(F(", isStartingGroupAB=")); WebSerial.println(isStartingGroupAB);
         WebSerial.println(F("Master: Start Trigger erhalten in ROT."));
-        setState(GELB_PREP, TONE_START_PASSE); // Gehe zu GELB_PREP (10s Vorbereitung), spiele Startton
+        setState(GELB_PREP, TONE_GO_TO_LINE); // Gehe zu GELB_PREP (10s Vorbereitung), spiele Zweifachton
       }
       // Im ROT-Zustand gibt es keine automatischen Zeitübergänge.
       break;
@@ -711,7 +765,7 @@ void processTrafficLightState() {
       // Übergang zu GRUEN nach 10 Sekunden.
       if (elapsedTime >= yellowDurationPrep) {
          WebSerial.println(F("Master: Gelb_Prep Zeit abgelaufen. Wechsel zu GRUEN."));
-        setState(GRUEN, TONE_GRUEN_GO); // Gehe zu GRUEN (Haupt-Schießzeit), spiele Doppelton
+        setState(GRUEN, TONE_SHOOT_START); // Gehe zu GRUEN (Haupt-Schießzeit), spiele Einmalton
       }
        // --> Die Logik wurde nach oben verschoben <--
       break;
@@ -741,14 +795,13 @@ void processTrafficLightState() {
         WebSerial.print(F("DEBUG (GELB_REST Ende): Vor Berechnung: abCdPhase=")); WebSerial.print(abCdPhase);
         WebSerial.print(F(", isStartingGroupAB=")); WebSerial.println(isStartingGroupAB);
 
-        ToneType toneToPlay = TONE_NONE;
+        ToneType toneToPlay = TONE_NONE; // Initialisiere mit TONE_NONE
         int finishedPhase = abCdPhase; // Phase, die gerade schießt/fertig ist
         bool isEndOfEnd = false;      // Flag, ob das gesamte End vorbei ist
 
         // Bestimme den Ton basierend auf der Gruppe, die gerade fertig ist (finishedPhase)
         if (targetMode == targetModes[1]) { // "AB/CD"
            if (finishedPhase == 0) { // AB Gruppe ist fertig
-               toneToPlay = TONE_END_AB; // Doppelton
                // AB ist fertig. War AB die Startgruppe (isStartingGroupAB)?
                // Wenn NEIN, dann war CD die Startgruppe, und AB war die zweite Gruppe. Das End ist vorbei.
                if (!isStartingGroupAB) {
@@ -756,13 +809,17 @@ void processTrafficLightState() {
                }
                // Wenn JA, dann war AB die Startgruppe, und AB ist die erste Gruppe, die fertig ist. End ist noch nicht vorbei.
            } else { // CD Gruppe ist fertig (finishedPhase == 1)
-               toneToPlay = TONE_END_CD; // Dreifachton
                // CD ist fertig. War CD die Startgruppe (isStartingGroupAB)?
                // Wenn JA, dann war CD die Startgruppe, und CD ist die erste Gruppe, die fertig ist. End ist noch nicht vorbei.
-               // Wenn NEIN, dann war AB die Startgruppe, und CD war die zweite Gruppe. Das End ist vorbei.
                 if (isStartingGroupAB) { // Wenn AB die Startgruppe war, dann ist CD die zweite Gruppe
                    isEndOfEnd = true; // End ist vorbei
                }
+           }
+           // Ton spielen basierend auf isEndOfEnd
+           if (isEndOfEnd) {
+               toneToPlay = TONE_END_OF_END; // Dreimaliges Signal für das Ende eines AB/CD Endes
+           } else {
+               toneToPlay = TONE_GROUP_CHANGE; // Zweimaliges Signal für Gruppenwechsel
            }
 
            // Setze die abCdPhase für den NÄCHSTEN DURCHGANG (entweder die andere Gruppe in diesem End, oder die Startgruppe des nächsten Ends)
@@ -796,7 +853,7 @@ void processTrafficLightState() {
 
 
         } else { // Standard Modus fertig
-           toneToPlay = TONE_END_STANDARD; // Dreifachton
+           toneToPlay = TONE_END_OF_END; // Dreifachton
            abCdPhase = 0; // Phase bleibt 0 im Standard Modus
            isEndOfEnd = true; // Ein End im Standard Modus ist immer ein ganzes End
            // isStartingGroupAB wird im Standard Modus nicht verwendet, aber wir setzen es zur Sicherheit auf true
@@ -809,12 +866,14 @@ void processTrafficLightState() {
         // Spielen des Tons direkt hier (blockierend)
         noTone(piezoPin); // Alten Ton stoppen
          switch(toneToPlay) {
-             case TONE_END_AB:
-                 tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); // Doppelton
+             case TONE_END_OF_END: // Dreimaliges Pfeifen
+                 tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
                  break;
-             case TONE_END_CD:
-             case TONE_END_STANDARD:
-                 tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); // Dreifachton
+             case TONE_GROUP_CHANGE: // Zweimaliges Pfeifen
+                 tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
+                 break;
+             case TONE_NONE:
+                 // Kein Ton
                  break;
              default: // Sollte für diese Übergänge nicht TONE_NONE sein
                  break;
@@ -828,7 +887,6 @@ void processTrafficLightState() {
       break; // break for GELB_REST case
   }
 }
-
 
 // Wechselt den Zustand der Ampel (nur im Master aufrufen oder im Slave durch Callback!)
 // Setzt Timer neu, spielt spezifische Töne (NUR DIE NICHT-BLOCKIERENDEN), sendet NRF
@@ -845,23 +903,27 @@ void setState(State newState, ToneType toneTypeToPlay ) {
         WebSerial.print(F(" (Tone Type: ")); WebSerial.print(toneTypeToPlay ); WebSerial.println(F(") - Sende ESP-NOW."));
 
         // Akustische Signale basierend auf dem übergebenen ToneType (NUR TÖNE, DIE HIER GESPIELT WERDEN)
-        // Die Töne END_AB, END_CD, END_STANDARD werden jetzt in processTrafficLightState gespielt (blockierend).
+        // Die Töne TONE_GROUP_CHANGE und TONE_END_OF_END werden jetzt in processTrafficLightState gespielt (blockierend).
         // Hier spielen wir nur die nicht-blockierenden (oder kürzeren) Töne.
         noTone(piezoPin); // Alten Ton stoppen
 
         switch(toneTypeToPlay ) { // Switch über den Parameter toneTypeToPlay
-          case TONE_START_PASSE: // Ein Ton bei Start (ROT -> GELB_PREP)
-          WebSerial.println(F("Ton (setState): Bei Start (ROT -> GELB_PREP)"));
-          tone(piezoPin, 1000, 100);
-          break;
-          case TONE_GRUEN_GO: // Zwei Töne (GELB_PREP -> GRUEN)
-          WebSerial.println(F("Ton (setState): Doppelt (GELB_PREP -> GRUEN)"));
-          tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
-          break;
-          case TONE_EMERGENCY: // Wird bereits in triggerEmergencyStop() gespielt, hier nur loggen/senden
+          case TONE_GO_TO_LINE: // Zweimaliges Pfeifen: Zur Schießlinie gehen
+            WebSerial.println(F("Ton (setState): Zweimal (ROT -> GELB_PREP, Zur Schiesslinie)"));
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin);
+            break;
+          case TONE_SHOOT_START: // Einmaliges Pfeifen: Schießbeginn
+            WebSerial.println(F("Ton (setState): Einmal (GELB_PREP -> GRUEN, Schiessbeginn)"));
+            tone(piezoPin, 1000, 100); noTone(piezoPin);
+            break;
+          case TONE_END_OF_END: // Dreimaliges Pfeifen: Pfeile hohlen
+            WebSerial.println(F("Ton (setState): Dreimal (Pfeile hohlen)"));
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); tone(piezoPin, 1000, 50);
+            break;
+          case TONE_EMERGENCY: // Wird bereits in triggerEmergencyStop() gespielt, hier nur loggen/sende
              WebSerial.println(F("Ton (setState): Notfall (bereits gespielt)"));
           break;
-             // Töne END_AB, END_CD, END_STANDARD werden in processTrafficLightState gespielt (blockierend)
+             // Töne TONE_GROUP_CHANGE und TONE_END_OF_END werden in processTrafficLightState gespielt (blockierend)
              // TONE_NONE
              default: // TONE_NONE oder andere Typen, die hier nicht gespielt werden
                 noTone(piezoPin); // Keine Töne
@@ -1056,7 +1118,7 @@ void updateLEDs() {
            } else {
                remainingSecondsRest = 0;
            }
-          snprintf(buf, sizeof(buf), "Zeit: %ds", remainingSecondsRest);
+          snprintf(buf, sizeof(buf), "Zeit: %3ds", remainingSecondsRest);
           u8g2.drawStr(2, 25, buf);
           // Zeige aktive Gruppe im AB/CD Modus
           if (targetMode == targetModes[1]) { // "AB/CD"
@@ -1097,7 +1159,6 @@ void updateLEDs() {
     // updateLEDs() wird separat am Ende von loop() aufgerufen, wenn !isOtaRunning
   }
 
-// Funktion zum Zeichnen des Menüs auf dem Display
 void drawMenu() {
   if (!inMenu) return;
 
@@ -1110,24 +1171,29 @@ void drawMenu() {
       u8g2.drawStr(2, 10, "Einstellungen:");
 
       // Menüpunkte mit Auswahl-Indikator und aktuellem Wert
+      // Die Schleife geht jetzt bis zum letzten Element, das "Zurueck" ist
       for (int i = 0; i < sizeof(menuItems) / sizeof(menuItems[0]); i++) {
         const char* itemText = menuItems[i];
         const char* currentValue = "";
         int yPos = 25 + i * 8; // Vertikaler Abstand angepasst an Schriftart
  
-        // Spezielle Behandlung für "Web Log"
-        // Vergleiche Index statt String, wenn möglich und Index bekannt ist (hier: letztes Element)
-        if (i == (sizeof(menuItems) / sizeof(menuItems[0]) - 1)) { // "Web Log"
+        // Spezielle Behandlung für "Web Log" und andere Einstellungen
+        if (strcmp(itemText, PSTR("Web Log")) == 0) { // Vergleiche mit "Web Log"
             currentValue = WebSerial.isWebLogEnabled() ? PSTR("Enabled") : PSTR("Disabled");
-        } else if (i == 0) currentValue = shootingTimeSetting; // Schießzeit (3/6 Pfeile)
-        else if (i == 1) currentValue = targetMode;     // Zielmodus (Standard/AB/CD)
-        else if (i == 2) currentValue = currentRole;    // Rolle (Master/Slave)
- 
+        } else if (strcmp(itemText, PSTR("Schiesszeit")) == 0) {
+            currentValue = shootingTimeSetting;
+        } else if (strcmp(itemText, PSTR("Zielmodus")) == 0) {
+            currentValue = targetMode;
+        } else if (strcmp(itemText, PSTR("Rolle")) == 0) {
+            currentValue = currentRole;
+        }
+        // Für "Zurueck" bleibt currentValue leer
+
         if (i == currentMenuItem) {
-          snprintf(buf, sizeof(buf), "> %s: %s", itemText, currentValue);
+          snprintf(buf, sizeof(buf), "> %s%s%s", itemText, (currentValue[0] != '\0' ? ": " : ""), currentValue); // Füge ": " nur hinzu, wenn currentValue nicht leer
           u8g2.drawStr(2, yPos, buf);
         } else {
-          snprintf(buf, sizeof(buf), "  %s: %s", itemText, currentValue);
+          snprintf(buf, sizeof(buf), "  %s%s%s", itemText, (currentValue[0] != '\0' ? ": " : ""), currentValue); // Füge ": " nur hinzu, wenn currentValue nicht leer
           u8g2.drawStr(4, yPos, buf);
         }
       }
@@ -1143,18 +1209,20 @@ void drawMenu() {
       if (selectionMenuItem == 0) { optionsArray = shootingTimeOptions; numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]); currentActiveIndex = currentShootingTimeIndex; }
       else if (selectionMenuItem == 1) { optionsArray = targetModes; numOptions = sizeof(targetModes) / sizeof(targetModes[0]); currentActiveIndex = currentTargetModeIndex; }
       else if (selectionMenuItem == 2) { optionsArray = roleModes; numOptions = sizeof(roleModes) / sizeof(roleModes[0]); currentActiveIndex = currentRoleIndex; }
+      
       if (optionsArray != nullptr) {
-          for (int i = 0; i < numOptions; i++) {
+          for (int i = 0; i < numOptions; i++) { // Schleife geht jetzt bis zum letzten Element ("Zurueck")
               int yPos = 25 + i * 8; // Vertikaler Abstand angepasst
               const char* prefix = "  "; // Standard-Einrückung
               if (i == currentSelectionIndex) {
                   prefix = "> "; // Aktuell im Auswahlmodus gewählt
               }
               String suffix = "";
-              if (i == currentActiveIndex) {
-                  suffix = " *"; // Markiert die aktuell gespeicherte Einstellung
+              // Markiere die aktuell gespeicherte Einstellung, aber NICHT die "Zurueck"-Option
+              if (i == currentActiveIndex && strcmp(optionsArray[i], PSTR("Zurueck")) != 0) {
+                  suffix = " *"; 
               }
-              snprintf(buf, sizeof(buf), "%s%s%s", prefix, optionsArray[i], suffix);
+              snprintf(buf, sizeof(buf), "%s%s%s", prefix, optionsArray[i], suffix.c_str());
               u8g2.drawStr(2, yPos, buf);
           }
       }
@@ -1163,6 +1231,7 @@ void drawMenu() {
   u8g2.sendBuffer(); // Display aktualisieren
   // LEDs werden auch im Menü durch updateLEDs() am Ende von loop() aktualisiert (wenn nicht OTA).
 }
+
 
 // Callback-Funktion, die aufgerufen wird, wenn Daten gesendet wurden
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -1195,13 +1264,13 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
            WebSerial.printf("KeepAlive: PONG empfangen von %s.\n", macStr);
            lastPongReceivedTime = millis(); // Zeit des letzten PONG aktualisieren (global)
            connectionOk = true; // Verbindung ist OK (mindestens einer antwortet)
-        } // PING Nachrichten vom Slave werden ignoriert (sollten nicht vorkommen)
+        } // PING Nachrichten vom Master werden ignoriert (sollten nicht vorkommen)
      } else {
         // Slave empfängt PING vom Master
         if (receivedMsg.type == PING) {
            WebSerial.println("KeepAlive: PING empfangen.");
-           // PONG zurücksenden (F() Makro nicht nötig für println ohne Argument)
-           KeepAliveMsg pongMsg = {PONG};
+           // PONG Zuruecksenden (F() Makro nicht nötig für println ohne Argument)
+           KeepAliveMsg pongMsg = {PING};
            // Slave sendet Pong an die MAC des Masters (die in mac_addr steht)
            // Wichtig: Der Master muss als Peer beim Slave registriert sein! Sende an recv_info->src_addr
            esp_err_t result = esp_now_send(recv_info->src_addr, (uint8_t *) &pongMsg, sizeof(pongMsg));
@@ -1253,7 +1322,7 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     if (receivedToneType == TONE_EMERGENCY) {
        WebSerial.println(F("!!! Slave: Notfall empfangen !!!"));
        currentState = ROT; // Sofort auf ROT
-       abCdPhase = 0;      // Sequenz zurücksetzen
+       abCdPhase = 0;      // Sequenz Zuruecksetzen
        isStartingGroupAB = true;
        startTime = millis(); // Timer neu starten für ROT (F() Makro nicht nötig für println ohne Argument)
        noTone(piezoPin); // Alle Töne stoppen
@@ -1265,10 +1334,14 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
 
       // Tonfolgen replizieren (Achtung: delays in Callbacks können problematisch sein!)
       switch(receivedToneType) {
-        case TONE_START_PASSE: tone(piezoPin, 1000, 100); break;
-        case TONE_GRUEN_GO: tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
-        case TONE_END_AB: tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
-        case TONE_END_CD: case TONE_END_STANDARD: tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
+        case TONE_GO_TO_LINE: // Zweimaliges Pfeifen
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
+        case TONE_SHOOT_START: // Einmaliges Pfeifen
+            tone(piezoPin, 1000, 100); noTone(piezoPin); break;
+        case TONE_GROUP_CHANGE: // Zweimaliges Pfeifen
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
+        case TONE_END_OF_END: // Dreimaliges Pfeifen
+            tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
         case TONE_EMERGENCY: // Wird bereits oben behandelt, hier nichts mehr tun
            WebSerial.println(F("Slave: Notfallton wird nicht erneut gespielt."));
            break;
@@ -1581,7 +1654,7 @@ void handleRoot() {
 
 
 
-// NEU: Handler, der den aktuellen Status als JSON zurückgibt
+// NEU: Handler, der den aktuellen Status als JSON Zurueckgibt
 void handleStatusJson() {
   StaticJsonDocument<1024> doc; // Größe anpassen, falls mehr Daten benötigt werden
 
@@ -1699,7 +1772,7 @@ void handleWebStop() {
   }
 }
 
-// Webserver-Handler zum Zurücksetzen der Ampel auf Anfang (ROT, AB als Startgruppe)
+// Webserver-Handler zum Zuruecksetzen der Ampel auf Anfang (ROT, AB als Startgruppe)
 void handleWebReset() {
    if (isMaster && !isOtaRunning && !otaTimedOut) {
        WebSerial.println(F("Web: Reset Trigger erhalten. Setze Ampel zurueck."));
@@ -1771,20 +1844,20 @@ void handleSetZielmodus() {
       targetMode = targetModes[0]; // "Standard"
       currentTargetModeIndex = 0;
       printCurrentSettings();
-       // Beim Wechsel des Zielmodus im Master, zurücksetzen auf Anfang Standard
-       abCdPhase = 0; // Phase zurücksetzen
-       isStartingGroupAB = true; // Startgruppe zurücksetzen
-       setState(ROT, TONE_NONE); // Zurück zu ROT, kein Ton
+       // Beim Wechsel des Zielmodus im Master, Zuruecksetzen auf Anfang Standard
+       abCdPhase = 0; // Phase Zuruecksetzen
+       isStartingGroupAB = true; // Startgruppe Zuruecksetzen
+       setState(ROT, TONE_NONE); // Zurueck zu ROT, kein Ton
       server.sendHeader("Location", "/", true); // Redirect zur Hauptseite
       server.send(302, "text/plain", "");       // Sende Redirect-Status
     } else if (server.arg("mode").equals("ABCD")) {
       targetMode = targetModes[1]; // "AB/CD"
       currentTargetModeIndex = 1;
       printCurrentSettings();
-       // Beim Wechsel des Zielmodus im Master, zurücksetzen auf Anfang AB/CD (AB startet)
-       abCdPhase = 0; // Phase zurücksetzen
-       isStartingGroupAB = true; // Startgruppe zurücksetzen
-       setState(ROT, TONE_NONE); // Zurück zu ROT, kein Ton
+       // Beim Wechsel des Zielmodus im Master, Zuruecksetzen auf Anfang AB/CD (AB startet)
+       abCdPhase = 0; // Phase Zuruecksetzen
+       isStartingGroupAB = true; // Startgruppe Zuruecksetzen
+       setState(ROT, TONE_NONE); // Zurueck zu ROT, kein Ton
       server.sendHeader("Location", "/", true); // Redirect zur Hauptseite
       server.send(302, "text/plain", "");       // Sende Redirect-Status
     } else {
@@ -1807,8 +1880,8 @@ void handleSetRolle() {
        if (!oldIsMaster) { // Wenn vorher Slave war
          WebSerial.println(F("Rolle auf Master gesetzt. ESP-NOW senden aktiv."));
          // Als neuer Master sollten wir den Zustand auf ROT setzen und senden (Anfangszustand)
-         abCdPhase = 0; // Phase zurücksetzen
-         isStartingGroupAB = true; // Startgruppe zurücksetzen
+         abCdPhase = 0; // Phase Zuruecksetzen
+         isStartingGroupAB = true; // Startgruppe Zuruecksetzen
          setState(ROT, TONE_NONE); // Setze Zustand auf ROT und sende via ESP-NOW
        }
       saveRoleToEEPROM(); // Rolle immer speichern, wenn sie explizit über das Webinterface gesetzt wird
@@ -1884,9 +1957,9 @@ void handleSetPeerMac() {
   updateEspNowPeers(); // Diese Funktion entfernt alte und fügt neue hinzu
 
   if (parseError) {
-     server.send(400, "text/plain", "Warnung: Mindestens eine MAC Adresse hatte ein ungültiges Format und wurde ignoriert/zurückgesetzt. Andere wurden gespeichert.");
+     server.send(400, "text/plain", "Warnung: Mindestens eine MAC Adresse hatte ein ungültiges Format und wurde ignoriert/Zurueckgesetzt. Andere wurden gespeichert.");
   } else {
-     // Bei Erfolg zur Hauptseite zurückleiten
+     // Bei Erfolg zur Hauptseite Zurueckleiten
      server.sendHeader("Location", "/", true);
      server.send(302, "text/plain", "");       // Sende Redirect-Status
   }
@@ -1948,7 +2021,7 @@ void updateEspNowPeers() {
 
   // 3. Alle gültigen Peers aus dem globalen slaveMacs Array hinzufügen
   WebSerial.println(F("  Adding peers from slaveMacs array..."));
-  numRegisteredSlaves = 0; // Zähler zurücksetzen
+  numRegisteredSlaves = 0; // Zähler Zuruecksetzen
   for (int i = 0; i < MAX_SLAVES; ++i) {
     // Prüfen, ob der Eintrag gültig ist (nicht alle 00 oder alle FF)
     bool isMacValid = false;
@@ -2120,19 +2193,26 @@ void handleFirmwareUploadSuccess() {
   }
 }
 
-// --- Button2 Callback Funktionen ---
-void handleJoystickSelectPressed(Button2& btn) {
-  WebSerial.println(F("DEBUG: handleJoystickSelectPressed aufgerufen."));
+void handleEncoderSwitchPressed(Button2& btn) {
+  WebSerial.println(F("DEBUG: handleEncoderSwitchPressed aufgerufen.")); // Optional: Debug-Ausgabe anpassen
+  
   if (!inMenu) { // Noch nicht im Menü
     // Immer Menü öffnen, egal ob Master oder Slave
     WebSerial.println(F("Button2: Joystick Select gedrückt ausserhalb Menue. Oeffne Hauptmenue."));
     inMenu = true;
     inSelectionMode = false; // Sicherstellen, dass wir im Hauptmenü starten
-    currentMenuItem = 0;
+    currentMenuItem = 0; // Setze den Startpunkt auf das erste Element
     drawMenu(); // Menü sofort zeichnen
   } else if (inMenu && !inSelectionMode) { // Im Hauptmenü
+      // NEU: Prüfen, ob "Zurueck" ausgewählt wurde
+      if (strcmp(menuItems[currentMenuItem], PSTR("Zurueck")) == 0) {
+          WebSerial.println(F("Button2: Hauptmenue: 'Zurueck' ausgewählt. Verlasse Menü."));
+          inMenu = false; // Menü verlassen
+          // Das Display wird in der nächsten loop()-Iteration durch updateDisplay() aktualisiert
+          return; // Funktion beenden
+      }
       // Prüfen, ob der ausgewählte Punkt "Web Log" ist
-      if (strcmp(menuItems[currentMenuItem], "Web Log") == 0) { // Vergleiche mit "Web Log"
+      else if (strcmp(menuItems[currentMenuItem], PSTR("Web Log")) == 0) { // Vergleiche mit "Web Log"
           WebSerial.println(F("Button2: Hauptmenue: Web Log ausgewaehlt. Toggle Web Log."));
           WebSerial.enableWebLog(!WebSerial.isWebLogEnabled()); // Toggle den Web Log Zustand
           drawMenu(); // Menü neu zeichnen, um den geänderten Zustand anzuzeigen
@@ -2141,12 +2221,27 @@ void handleJoystickSelectPressed(Button2& btn) {
           WebSerial.println(F("Button2: Hauptmenue: Select gedrueckt. Wechsle zu Auswahlmodus."));
           inSelectionMode = true;
           selectionMenuItem = currentMenuItem;
+          // Setze den initialen Auswahlindex auf den aktuell gespeicherten Wert
           if (selectionMenuItem == 0) currentSelectionIndex = currentShootingTimeIndex;
           else if (selectionMenuItem == 1) currentSelectionIndex = currentTargetModeIndex;
           else if (selectionMenuItem == 2) currentSelectionIndex = currentRoleIndex;
           drawMenu(); // Auswahlmodus zeichnen
       }
   } else if (inMenu && inSelectionMode) { // Im Auswahlmodus -> Auswahl bestätigen
+      const char** optionsArray = nullptr;
+      int numOptions = 0;
+      if (selectionMenuItem == 0) { optionsArray = shootingTimeOptions; numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]); }
+      else if (selectionMenuItem == 1) { optionsArray = targetModes; numOptions = sizeof(targetModes) / sizeof(targetModes[0]); }
+      else if (selectionMenuItem == 2) { optionsArray = roleModes; numOptions = sizeof(roleModes) / sizeof(roleModes[0]); }
+
+      // NEU: Prüfen, ob "Zurueck" im Auswahlmodus ausgewählt wurde
+      if (optionsArray != nullptr && strcmp(optionsArray[currentSelectionIndex], PSTR("Zurueck")) == 0) {
+          WebSerial.println(F("Button2: Auswahlmodus: 'Zurueck' ausgewählt. Gehe zu Hauptmenü."));
+          inSelectionMode = false; // Zurueck zum Hauptmenü
+          drawMenu(); // Hauptmenü neu zeichnen
+          return; // Funktion beenden
+      }
+
       WebSerial.print(F("Button2: Auswahlmodus: Select gedrueckt. Bestaetige Auswahl fuer ")); WebSerial.println(menuItems[selectionMenuItem]);
       // Einstellung basierend auf selectionMenuItem und currentSelectionIndex speichern
       if (selectionMenuItem == 0) { // Schießzeit
@@ -2174,44 +2269,11 @@ void handleJoystickSelectPressed(Button2& btn) {
         saveRoleToEEPROM();
       }
       printCurrentSettings(); // Geänderte Einstellung ausgeben
-      inSelectionMode = false; // Zurück zum Hauptmenü
+      inSelectionMode = false; // Zurueck zum Hauptmenü
       drawMenu(); // Hauptmenü wieder zeichnen
   }
 }
 
-void handleJoystickUpPressed(Button2& btn) {
-  WebSerial.println(F("DEBUG: handleJoystickUpPressed aufgerufen."));
-  if (inMenu) {
-    WebSerial.println(F("Button2: Joystick Hoch gedrückt."));
-    if (!inSelectionMode) { // Im Hauptmenü navigieren
-        currentMenuItem = (currentMenuItem > 0) ? currentMenuItem - 1 : (sizeof(menuItems) / sizeof(menuItems[0]) - 1);
-    } else { // Im Auswahlmodus navigieren
-        int numOptions = 0;
-        if (selectionMenuItem == 0) numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]);
-        else if (selectionMenuItem == 1) numOptions = sizeof(targetModes) / sizeof(targetModes[0]);
-        else if (selectionMenuItem == 2) numOptions = sizeof(roleModes) / sizeof(roleModes[0]);
-        currentSelectionIndex = (currentSelectionIndex > 0) ? currentSelectionIndex - 1 : numOptions - 1;
-    }
-    drawMenu(); // Menü neu zeichnen
-  }
-}
-
-void handleJoystickDownPressed(Button2& btn) {
-  WebSerial.println(F("DEBUG: handleJoystickDownPressed aufgerufen."));
-  if (inMenu) {
-    WebSerial.println(F("Button2: Joystick Runter gedrückt."));
-    if (!inSelectionMode) { // Im Hauptmenü navigieren
-        currentMenuItem = (currentMenuItem < (sizeof(menuItems) / sizeof(menuItems[0]) - 1)) ? currentMenuItem + 1 : 0;
-    } else { // Im Auswahlmodus navigieren
-        int numOptions = 0;
-        if (selectionMenuItem == 0) numOptions = sizeof(shootingTimeOptions) / sizeof(shootingTimeOptions[0]);
-        else if (selectionMenuItem == 1) numOptions = sizeof(targetModes) / sizeof(targetModes[0]);
-        else if (selectionMenuItem == 2) numOptions = sizeof(roleModes) / sizeof(roleModes[0]);
-        currentSelectionIndex = (currentSelectionIndex < numOptions - 1) ? currentSelectionIndex + 1 : 0;
-    }
-    drawMenu(); // Menü neu zeichnen
-  }
-}
 
 void handleStartStopPressed(Button2& btn) {
   WebSerial.println(F("DEBUG: handleStartStopPressed aufgerufen."));
