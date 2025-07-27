@@ -32,12 +32,22 @@ struct PairingMessage {
   uint8_t macAddr[6];
 };
 
+// Definition von Ton-Typen für die NRF Kommunikation und Steuerung
+enum ToneType {
+  TONE_NONE,
+  TONE_GO_TO_LINE,    // Zweimaliges Pfeifen: Zur Schießlinie gehen (Regel 6.7.2.1, 1. Punkt)
+  TONE_SHOOT_START,   // Einmaliges Pfeifen: Schießbeginn (Regel 6.7.2.1, 2. und 5. Punkt)
+  TONE_GROUP_CHANGE,  // Zweimaliges Pfeifen: Schießzeit beendet, Gruppenwechsel (Regel 6.7.2.1, 3. Punkt)
+  TONE_END_OF_END,    // Dreimaliges Pfeifen: Schießzeit beendet, Trefferaufnahme (Regel 6.7.2.1, 6. Punkt)
+  TONE_EMERGENCY      // Reihe aufeinanderfolgender Pfiffe: Gefahr (Regel 6.7.2.1, 7. Punkt)
+};
+
 // Passe die AmpelState Nachricht an, um den Typ zu enthalten
 struct AmpelStateMessage {
   MessageType type;
   State state;
   int abCdPhase;
-  ToneType lastToneType;
+  ToneType toneType;
   bool isStartingGroupAB;
   uint8_t shootingTimeIndex;
   uint8_t targetModeIndex;
@@ -88,16 +98,6 @@ public:
   }
   // Übernahme der flush() Methode von HardwareSerial, falls benötigt
   void flush() { _realSerial.flush(); }
-};
-
-// Definition von Ton-Typen für die NRF Kommunikation und Steuerung
-enum ToneType {
-  TONE_NONE,
-  TONE_GO_TO_LINE,    // Zweimaliges Pfeifen: Zur Schießlinie gehen (Regel 6.7.2.1, 1. Punkt)
-  TONE_SHOOT_START,   // Einmaliges Pfeifen: Schießbeginn (Regel 6.7.2.1, 2. und 5. Punkt)
-  TONE_GROUP_CHANGE,  // Zweimaliges Pfeifen: Schießzeit beendet, Gruppenwechsel (Regel 6.7.2.1, 3. Punkt)
-  TONE_END_OF_END,    // Dreimaliges Pfeifen: Schießzeit beendet, Trefferaufnahme (Regel 6.7.2.1, 6. Punkt)
-  TONE_EMERGENCY      // Reihe aufeinanderfolgender Pfiffe: Gefahr (Regel 6.7.2.1, 7. Punkt)
 };
 
 // Definition der LED-Pins
@@ -178,7 +178,7 @@ State currentState = ROT;
 const unsigned long KEEP_ALIVE_INTERVAL = 5000; // Intervall für PING (ms)
 const unsigned long CONNECTION_TIMEOUT = KEEP_ALIVE_INTERVAL + 2000; // Timeout (etwas länger als Intervall)
 unsigned long lastPingSentTime = 0;      // Master: Wann wurde letzter PING gesendet?
-unsigned long lastPongReceivedTime = 0; // Master: Wann kam letztes PONG an?
+unsigned long lastPongReceivedTime[MAX_SLAVES]; // Master: Wann kam letztes PONG an?
 unsigned long lastMessageReceivedTime = 0; // Slave: Wann kam letzte Nachricht (PING oder State) an?
 bool connectionOk = false; // Status der Verbindung (startet als nicht OK)
 
@@ -435,7 +435,7 @@ void setup() {
   WiFiManager wm;
 
   // Setzt das Timeout für den Konfigurations-Access-Point auf 180 Sekunden
-  wm.setAPConnectTimeout(180); 
+  wm.setConnectTimeout(180); 
 
   // Versucht, sich mit gespeicherten Daten zu verbinden.
   // Wenn das fehlschlägt, wird ein Access Point mit dem Namen "Bogenampel-Setup" gestartet.
@@ -676,7 +676,17 @@ void loop() {
            // sondern auf die Antwort warten.
         }
         // Master: Verbindung prüfen (Timeout seit letztem PONG)
-        connectionOk = (now - lastPongReceivedTime < CONNECTION_TIMEOUT);
+        if (isMaster) { // Only master checks connection status of slaves
+    unsigned long now = millis();
+    bool anySlaveConnected = false;
+    for (int i = 0; i < numRegisteredSlaves; ++i) {
+        if (now - lastPongReceivedTime[i] < CONNECTION_TIMEOUT) {
+            anySlaveConnected = true;
+            break; // Found at least one connected slave, no need to check further
+        }
+    }
+    connectionOk = anySlaveConnected; // Update the global connection status
+}
      } else {
         // Slave: Verbindung prüfen (Timeout seit letzter Nachricht vom Master)
         connectionOk = (now - lastMessageReceivedTime < CONNECTION_TIMEOUT);
@@ -995,7 +1005,7 @@ void setState(State newState, ToneType toneTypeToPlay ) {
          // Sende den neuen Zustand, die aktuelle Phase, den Ton-Typ UND die Startgruppen-Info per ESP-NOW
          currentStateData.state = currentState; // Sende den NEUEN Zustand
          currentStateData.abCdPhase = abCdPhase; // Sende die aktuelle AB/CD Phase (wurde in processTrafficLightState gesetzt)
-         currentStateData.lastToneType  = toneTypeToPlay ;           // Sende den ToneType (auch wenn Ton in processTrafficLightState gespielt wurde)
+         currentStateData.toneType  = toneTypeToPlay ;           // Sende den ToneType (auch wenn Ton in processTrafficLightState gespielt wurde)
          currentStateData.isStartingGroupAB = isStartingGroupAB; // Sende die Startgruppen-Info
          currentStateData.shootingTimeIndex = currentShootingTimeIndex; // Sende den Index der Schießzeit
          currentStateData.targetModeIndex = currentTargetModeIndex;     // Sende den Index des Zielmodus
@@ -1022,7 +1032,7 @@ void setState(State newState, ToneType toneTypeToPlay ) {
          // Sende den aktuellen Zustand mit dem neuen Ton-Typ
          currentStateData.state = currentState;
          currentStateData.abCdPhase = abCdPhase;
-         currentStateData.lastToneType  = toneTypeToPlay ;
+         currentStateData.toneType  = toneTypeToPlay ;
          currentStateData.isStartingGroupAB = isStartingGroupAB;
          currentStateData.shootingTimeIndex = currentShootingTimeIndex;
          currentStateData.targetModeIndex = currentTargetModeIndex;
@@ -1310,82 +1320,65 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 // Angepasste Signatur: const esp_now_recv_info_t *recv_info
 // Callback-Funktion, die aufgerufen wird, wenn Daten empfangen werden
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-	GenericMessage* msg = (GenericMessage*) incomingData;
+  // Diese Zeile ist in Ordnung, da msg immer der GenericMessage-Typ ist
+  GenericMessage* msg = (GenericMessage*) incomingData;
 
-if (isMaster && msg->type == PAIRING_REQUEST && len == sizeof(PairingMessage)) {
-      PairingMessage* pairMsg = (PairingMessage*) incomingData;
-      WebSerial.print(F("Master: Kopplungsanfrage empfangen von: "));
-      char macStr[18];
-      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-               pairMsg->macAddr[0], pairMsg->macAddr[1], pairMsg->macAddr[2], pairMsg->macAddr[3], pairMsg->macAddr[4], pairMsg->macAddr[5]);
-      WebSerial.println(macStr);
+  // --- Start der IF/ELSE IF Kette ---
 
-      // Prüfen, ob der Peer bereits registriert ist
-      bool alreadyExists = false;
-      for (int i = 0; i < numRegisteredSlaves; i++) {
-        if (memcmp(slaveMacs[i], pairMsg->macAddr, 6) == 0) {
-          alreadyExists = true;
-          break;
-        }
+  // 1. Fall: MASTER empfängt PAIRING_REQUEST
+  if (isMaster && msg->type == PAIRING_REQUEST && len == sizeof(PairingMessage)) {
+    PairingMessage* pairMsg = (PairingMessage*) incomingData;
+    WebSerial.print(F("Master: Kopplungsanfrage empfangen von: "));
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             pairMsg->macAddr[0], pairMsg->macAddr[1], pairMsg->macAddr[2], pairMsg->macAddr[3], pairMsg->macAddr[4], pairMsg->macAddr[5]);
+    WebSerial.println(macStr);
+
+    // Prüfen, ob der Peer bereits registriert ist
+    bool alreadyExists = false;
+    for (int i = 0; i < numRegisteredSlaves; i++) {
+      if (memcmp(slaveMacs[i], pairMsg->macAddr, 6) == 0) {
+        alreadyExists = true;
+        break;
       }
+    }
 
-      if (!alreadyExists) {
-        if (numRegisteredSlaves < MAX_SLAVES) {
-          // Neuen Slave zur Liste hinzufügen
-          memcpy(slaveMacs[numRegisteredSlaves], pairMsg->macAddr, 6);
-          
-          WebSerial.println(F("Neuer Slave wird hinzugefügt und gespeichert."));
-          savePeerMacsToEEPROM(); // Neue Liste im EEPROM speichern [cite: 83]
-          updateEspNowPeers();    // ESP-NOW Peer-Liste aktualisieren [cite: 70]
-
-        } else {
-          WebSerial.println(F("Maximale Anzahl an Slaves bereits erreicht!"));
-        }
+    if (!alreadyExists) {
+      if (numRegisteredSlaves < MAX_SLAVES) {
+        // Neuen Slave zur Liste hinzufügen
+        memcpy(slaveMacs[numRegisteredSlaves], pairMsg->macAddr, 6);
+        numRegisteredSlaves++; // Aktualisiere die Anzahl der registrierten Slaves
+        WebSerial.println(F("Neuer Slave wird hinzugefügt und gespeichert."));
+        savePeerMacsToEEPROM(); // Neue Liste im EEPROM speichern
+        updateEspNowPeers();    // ESP-NOW Peer-Liste aktualisieren
       } else {
-        WebSerial.println(F("Slave ist bereits bekannt."));
+        WebSerial.println(F("Maximale Anzahl an Slaves bereits erreicht!"));
       }
+    } else {
+      WebSerial.println(F("Slave ist bereits bekannt."));
+    }
+  } // <-- End of PAIRING_REQUEST block
 
-  } else if (!isMaster && msg->type == STATE_UPDATE && len == sizeof(AmpelStateMessage)) {
-    // --- AmpelState Nachricht empfangen (nur Slave) ---
-    if (isMaster) return; // Master ignoriert AmpelState Nachrichten
+  // 2. Fall: SLAVE empfängt STATE_UPDATE
+  else if (!isMaster && msg->type == STATE_UPDATE && len == sizeof(AmpelStateMessage)) {
+    // KEIN 'if (isMaster) return;' hier, da dieser else if Block schon !isMaster prüft.
 
-    memcpy(&currentStateData, incomingData, sizeof(currentStateData));
+    // Korrekt auf AmpelStateMessage casten
+    const AmpelStateMessage* stateMsg = reinterpret_cast<const AmpelStateMessage*>(incomingData);
 
-    State receivedState = currentStateData.state;
-    int receivedPhase = currentStateData.abCdPhase;
-    ToneType receivedToneType = currentStateData.lastToneType;
-    bool receivedIsStartingGroupAB = currentStateData.isStartingGroupAB;
-    uint8_t receivedShootingTimeIndex = currentStateData.shootingTimeIndex;
-    uint8_t receivedTargetModeIndex = currentStateData.targetModeIndex;
-
-  // -- NEU: Keep-Alive Logik für den Slave --
-  else if (!isMaster && msg->type == PING && len == sizeof(KeepAliveMsg)) {
-      lastMessageReceivedTime = millis(); // PING zählt auch als empfangene Nachricht
-      connectionOk = true;
-
-      WebSerial.println(F("Slave: PING empfangen, sende PONG zurück an Master."));
-
-      // PONG Nachricht erstellen und an den Absender (Master) zurücksenden
-      KeepAliveMsg pongMsg = {PONG};
-      esp_now_send(recv_info->src_addr, (uint8_t *) &pongMsg, sizeof(pongMsg));
-  }
-
-    // Aktualisiere lokale Variablen IMMER, wenn Daten empfangen
-    currentState = receivedState;
-    abCdPhase = receivedPhase;
-    isStartingGroupAB = receivedIsStartingGroupAB;
-    startTime = millis(); // Timer für den neuen Zustand starten (wichtig für Slave-Display)
-    currentShootingTimeIndex = receivedShootingTimeIndex;
-    currentTargetModeIndex = receivedTargetModeIndex;
-    // Aktualisiere die Strings basierend auf den Indices
-    shootingTimeSetting = shootingTimeOptions[currentShootingTimeIndex];
-    targetMode = targetModes[currentTargetModeIndex];
-    updateTimings(); // Stelle sicher, dass der Slave die korrekte Grünzeit verwendet
+    // Aktualisiere globale Zustandsvariablen direkt von der empfangenen Nachricht
+    currentState = stateMsg->state;
+    abCdPhase = stateMsg->abCdPhase;
+    isStartingGroupAB = stateMsg->isStartingGroupAB;
+    currentShootingTimeIndex = stateMsg->shootingTimeIndex;
+    currentTargetModeIndex = stateMsg->targetModeIndex;
+    ToneType receivedToneType = stateMsg->toneType; // Lokal deklariert und zugewiesen
 
     // Empfangszeit und Status aktualisieren
     lastMessageReceivedTime = millis();
-    connectionOk = true; // Verbindung ist OK
+    connectionOk = true;
 
+    // Logging der empfangenen Daten
     WebSerial.print(F("Slave empfaengt Zustand: ")); WebSerial.print(currentState);
     WebSerial.print(F(" Phase: ")); WebSerial.print(abCdPhase);
     WebSerial.print(F(" Ton: ")); WebSerial.print(receivedToneType);
@@ -1393,29 +1386,22 @@ if (isMaster && msg->type == PAIRING_REQUEST && len == sizeof(PairingMessage)) {
     WebSerial.print(F(" ZielmodusIdx: ")); WebSerial.print(currentTargetModeIndex);
     WebSerial.print(F(" Startgruppe AB?: ")); WebSerial.println(isStartingGroupAB);
 
-// -- NEU: Keep-Alive Logik für den Master --
-  else if (isMaster && msg->type == PONG && len == sizeof(KeepAliveMsg)) {
-      lastPongReceivedTime = millis(); // Zeit des letzten PONGs aktualisieren
-      connectionOk = true;
+    // Aktualisiere die Strings basierend auf den Indices
+    shootingTimeSetting = shootingTimeOptions[currentShootingTimeIndex];
+    targetMode = targetModes[currentTargetModeIndex];
+    updateTimings(); // Stelle sicher, dass der Slave die korrekte Grünzeit verwendet
 
-      char macStr[18];
-      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-               recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2], 
-               recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-      WebSerial.printf("Master: PONG empfangen von %s\n", macStr);
-  }
-
-    // Notfall-Behandlung im Slave
+    // Notfall-Behandlung im Slave (spezifisch für STATE_UPDATE)
     if (receivedToneType == TONE_EMERGENCY) {
-       WebSerial.println(F("!!! Slave: Notfall empfangen !!!"));
-       currentState = ROT; // Sofort auf ROT
-       abCdPhase = 0;      // Sequenz Zuruecksetzen
-       isStartingGroupAB = true;
-       startTime = millis(); // Timer neu starten für ROT (F() Makro nicht nötig für println ohne Argument)
-       noTone(piezoPin); // Alle Töne stoppen
+      WebSerial.println(F("!!! Slave: Notfall empfangen !!!"));
+      currentState = ROT; // Sofort auf ROT
+      abCdPhase = 0;      // Sequenz Zuruecksetzen
+      isStartingGroupAB = true;
+      startTime = millis(); // Timer neu starten für ROT
+      noTone(piezoPin); // Alle Töne stoppen
     }
     // Akustische Signale (Slave-Modus, spielt empfangenen Ton, wenn != TONE_NONE)
-    if (receivedToneType != TONE_NONE) {
+    else if (receivedToneType != TONE_NONE) { // 'else if' hier, damit nicht auch TONE_EMERGENCY abgespielt wird
       WebSerial.print("Slave: Spiele empfangenen Ton Typ: "); WebSerial.println(receivedToneType);
       noTone(piezoPin); // Alten Ton stoppen
 
@@ -1430,17 +1416,59 @@ if (isMaster && msg->type == PAIRING_REQUEST && len == sizeof(PairingMessage)) {
         case TONE_END_OF_END: // Dreimaliges Pfeifen
             tone(piezoPin, 1000, 50); delay(150); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); delay(50); tone(piezoPin, 1000, 50); noTone(piezoPin); break;
         case TONE_EMERGENCY: // Wird bereits oben behandelt, hier nichts mehr tun
-           WebSerial.println(F("Slave: Notfallton wird nicht erneut gespielt."));
-           break;
+            WebSerial.println(F("Slave: Notfallton wird nicht erneut gespielt."));
+            break;
         default: noTone(piezoPin); break;
       }
     } else {
       noTone(piezoPin); // Stoppe jeden laufenden Ton
     }
-  } else {
-    WebSerial.println(F("Empfangene Daten haben falsche Länge!"));
+  } // <-- End of STATE_UPDATE block
+
+  // 3. Fall: SLAVE empfängt PING (Keep-Alive)
+  else if (!isMaster && msg->type == PING && len == sizeof(KeepAliveMsg)) { // Zeile 1362 (aus Ihrer Perspektive)
+    lastMessageReceivedTime = millis(); // PING zählt auch als empfangene Nachricht
+    connectionOk = true;
+
+    WebSerial.println(F("Slave: PING empfangen, sende PONG zurück an Master."));
+
+    // PONG Nachricht erstellen und an den Absender (Master) zurücksenden
+    const KeepAliveMsg* keepAliveMsg = reinterpret_cast<const KeepAliveMsg*>(incomingData);
+    KeepAliveMsg pongMsg = {PONG};
+    esp_now_send(recv_info->src_addr, (uint8_t *) &pongMsg, sizeof(pongMsg));
+  } // <-- End of PING block
+
+  // 4. Fall: MASTER empfängt PONG (Keep-Alive Antwort)
+  else if (isMaster && msg->type == PONG && len == sizeof(KeepAliveMsg)) { // Zeile 1397 (aus Ihrer Perspektive)
+    // Finden Sie den Slave-Index anhand der MAC-Adresse
+    int slaveIndex = -1;
+    for (int i = 0; i < numRegisteredSlaves; ++i) {
+        if (memcmp(slaveMacs[i], recv_info->src_addr, 6) == 0) {
+            slaveIndex = i;
+            break;
+        }
+    }
+    if (slaveIndex != -1) {
+        lastPongReceivedTime[slaveIndex] = millis(); // Aktualisieren für den spezifischen Slave
+        // connectionOk = true; // Dies müsste für jeden Slave einzeln verfolgt werden, wenn mehrere Slaves vorhanden sind
+    }
+
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2],
+             recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+    WebSerial.printf("Master: PONG empfangen von %s\n", macStr);
+  } // <-- End of PONG block
+
+  // 5. Fall: Unbekannter Nachrichtentyp oder falsche Länge
+  else { // Zeile 1440 (aus Ihrer Perspektive)
+    WebSerial.print(F("Unbekannter Nachrichtentyp oder Länge: Typ="));
+    WebSerial.print(msg->type);
+    WebSerial.print(F(", Länge="));
+    WebSerial.print(len);
+    WebSerial.println();
   }
-}
+} // <-- Die letzte schließende Klammer der Funktion OnDataRecv (Zeile 1443)
 
 // Webserver-Handler für die Root-Seite
 void handleRoot() {
