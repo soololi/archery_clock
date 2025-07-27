@@ -12,9 +12,36 @@
 #include <array>   // NEU: Für die MAC-Adressen in der Liste
 #include <Button2.h> // Button2 Bibliothek hinzufügen
 #include <ESP32Encoder.h> // NEU: Bibliothek für den KY-040 Drehgeber
+#include <WiFiManager.h> // Für die dynamische WLAN-Konfiguration
 
 // Definition des Ampelzustands
 enum State { ROT, GELB_PREP, GRUEN, GELB_REST };
+
+// --- NEUE Struktur für die Kopplung ---
+enum MessageType : uint8_t {
+  STATE_UPDATE,
+  PAIRING_REQUEST
+};
+
+struct GenericMessage {
+  MessageType type;
+};
+
+struct PairingMessage {
+  MessageType type;
+  uint8_t macAddr[6];
+};
+
+// Passe die AmpelState Nachricht an, um den Typ zu enthalten
+struct AmpelStateMessage {
+  MessageType type;
+  State state;
+  int abCdPhase;
+  ToneType lastToneType;
+  bool isStartingGroupAB;
+  uint8_t shootingTimeIndex;
+  uint8_t targetModeIndex;
+};
 
 // --- NEU: SerialAndWebLogger Klasse ---
 class SerialAndWebLogger : public Print {
@@ -94,16 +121,7 @@ long oldEncoderValue = 0;
 const int startStopButtonPin = 25; // Pin für Start/Stop Taster
 const int emergencyButtonPin = 26; // Pin für Notknopf Taster
 
-// Struktur für den Ampelzustand zur NRF-Kommunikation
-struct AmpelState {
-  State state;
-  int abCdPhase; // 0 = AB Gruppe, 1 = CD Gruppe (aktuell schießend/wartend in diesem End)
-  ToneType lastToneType; // Zuletzt gespielter Ton-Typ
-  bool isStartingGroupAB; // True, wenn AB das nächste End startet, False, wenn CD startet
-  uint8_t shootingTimeIndex; // Index für 3/6 Pfeile (0=3, 1=6)
-  uint8_t targetModeIndex;   // Index für Standard/ABCD (0=Standard, 1=ABCD)
-};
-AmpelState currentStateData;
+AmpelStateMessage currentStateData;
 
 // NEU: Struktur für Keep-Alive Nachrichten
 enum KeepAliveType : uint8_t { PING = 0, PONG = 1 };
@@ -201,8 +219,6 @@ volatile bool manualStartTriggered = false; // Auslöser, um von ROT zu GELB_PRE
 volatile bool manualStopTriggered = false;  // Auslöser, um von GELB_PREP/GRUEN/GELB_REST sofort zu ROT zu wechseln
 
 // WLAN Konfiguration
-const char* ssid = "oli&kika";       // Hier deine WLAN-SSID eintragen
-const char* password = "Nruter12";   // Hier dein WLAN-Passwort eintragen
 const char* otaHostname = "BogenAmpel"; // Optional: Hostname für OTA
 
 // OTA Timeout Konfiguration
@@ -410,19 +426,27 @@ void setup() {
   loadRoleFromEEPROM();
   printCurrentSettings(); // Jetzt mit der geladenen Rolle ausgeben
 
-  // WLAN verbinden
+// --- NEU: Dynamische WLAN-Verbindung mit WiFiManager ---
   WiFi.mode(WIFI_STA);
-  WebSerial.print(F("MAC Adresse dieses Geräts: ")); WebSerial.println(WiFi.macAddress());
-  WiFi.begin(ssid, password);
-  WebSerial.print(F("Verbinde mit WLAN: "));
-  WebSerial.println(ssid);
-  // Blockiert, bis verbunden. OK für Setup.
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    WebSerial.println(F("Verbindungsfehler. Starte neu..."));
+  WebSerial.print(F("Eigene MAC Adresse: "));
+  WebSerial.println(WiFi.macAddress());
+
+  // WiFiManager initialisieren
+  WiFiManager wm;
+
+  // Setzt das Timeout für den Konfigurations-Access-Point auf 180 Sekunden
+  wm.setAPConnectTimeout(180); 
+
+  // Versucht, sich mit gespeicherten Daten zu verbinden.
+  // Wenn das fehlschlägt, wird ein Access Point mit dem Namen "Bogenampel-Setup" gestartet.
+  if (!wm.autoConnect("Bogenampel-Setup")) {
+    WebSerial.println(F("Fehler beim Verbinden und Timeout erreicht. Neustart in 5 Sekunden."));
     delay(5000);
     ESP.restart();
   }
-  WebSerial.println(F("WLAN verbunden"));
+
+  // Wenn wir hier ankommen, ist die Verbindung erfolgreich.
+  WebSerial.println(F("WLAN verbunden!"));
   WebSerial.print(F("IP Adresse: "));
   WebSerial.println(WiFi.localIP());
 
@@ -435,6 +459,21 @@ void setup() {
     WebSerial.println(F("Fehler beim Initialisieren von ESP-NOW"));
     return;
   }
+
+// -- NEU: Broadcast-Peer für den MASTER hinzufügen, um Pairing-Anfragen zu empfangen --
+if (isMaster) {
+  uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  esp_now_peer_info_t peerInfoBroadcast = {}; // Initialisieren
+  memcpy(peerInfoBroadcast.peer_addr, broadcastAddress, 6);
+  peerInfoBroadcast.channel = 0;
+  peerInfoBroadcast.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfoBroadcast) != ESP_OK) {
+    WebSerial.println(F("Fehler beim Hinzufügen des Broadcast-Peers für den Empfang von Anfragen."));
+  } else {
+    WebSerial.println(F("Master lauscht nun auf Broadcast-Adresse für Kopplungsanfragen."));
+  }
+}
 
   // Callback für gesendete Daten registrieren
   esp_now_register_send_cb(OnDataSent);
@@ -501,6 +540,29 @@ void setup() {
   ArduinoOTA.begin(); // Startet den OTA Service (auch HTTP Uploader)
   WebSerial.println(F("OTA bereit"));
   otaStartTime = millis(); // Starte den Timeout-Zähler, sobald OTA bereit ist
+
+// -- NEUE LOGIK für SLAVE --
+  if (!isMaster) {
+    WebSerial.println(F("Slave-Modus: Sende Kopplungsanfrage per Broadcast..."));
+
+    // Broadcast-Adresse als Peer hinzufügen, um eine Antwort vom Master zu erhalten
+    uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      WebSerial.println(F("Fehler beim Hinzufügen des Broadcast-Peers"));
+      return;
+    }
+
+    // Eigene MAC-Adresse in die Nachricht packen
+    PairingMessage pairMsg;
+    pairMsg.type = PAIRING_REQUEST;
+    WiFi.macAddress(pairMsg.macAddr);
+
+    // Nachricht senden
+    esp_now_send(broadcastAddress, (uint8_t *) &pairMsg, sizeof(pairMsg));
+  }
 
   // Webserver Routinen definieren
   server.on("/", handleRoot);         // Root-Seite
@@ -943,7 +1005,7 @@ void setState(State newState, ToneType toneTypeToPlay ) {
                        numRegisteredSlaves, currentState, abCdPhase, toneTypeToPlay , isStartingGroupAB);
 
          for (int i = 0; i < numRegisteredSlaves; ++i) { // Sende nur an die tatsächlich registrierten
-            esp_err_t result = esp_now_send(slaveMacs[i], (uint8_t *) &currentStateData, sizeof(currentStateData));
+            esp_err_t result = esp_now_send(slaveMacs[i], (uint8_t *) &currentStateData, sizeof(AmpelStateMessage)); // Wichtig: sizeof(AmpelStateMessage) verwenden!
             if (result != ESP_OK) {
                WebSerial.printf("  -> Fehler beim Senden an Slave %d (%02X:%02X:%02X:%02X:%02X:%02X)\n", i+1,
                              slaveMacs[i][0], slaveMacs[i][1], slaveMacs[i][2], slaveMacs[i][3], slaveMacs[i][4], slaveMacs[i][5]);
@@ -970,7 +1032,7 @@ void setState(State newState, ToneType toneTypeToPlay ) {
                        numRegisteredSlaves, currentState, abCdPhase, toneTypeToPlay , isStartingGroupAB);
 
          for (int i = 0; i < numRegisteredSlaves; ++i) {
-            esp_err_t result = esp_now_send(slaveMacs[i], (uint8_t *) &currentStateData, sizeof(currentStateData));
+            esp_err_t result = esp_now_send(slaveMacs[i], (uint8_t *) &currentStateData, sizeof(AmpelStateMessage)); // Wichtig: sizeof(AmpelStateMessage) verwenden!
             if (result != ESP_OK) {
                WebSerial.printf("  -> Fehler beim Senden an Slave %d (%02X:%02X:%02X:%02X:%02X:%02X)\n", i+1,
                              slaveMacs[i][0], slaveMacs[i][1], slaveMacs[i][2], slaveMacs[i][3], slaveMacs[i][4], slaveMacs[i][5]);
@@ -1246,43 +1308,44 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
 // Callback-Funktion, die aufgerufen wird, wenn Daten empfangen werden
 // Angepasste Signatur: const esp_now_recv_info_t *recv_info
+// Callback-Funktion, die aufgerufen wird, wenn Daten empfangen werden
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  // Wichtig: In Callbacks sollten Serial-Ausgaben kurz gehalten werden, um Timing-Probleme zu vermeiden.
-  // NEU: Unterscheidung nach Nachrichtenlänge
-  if (len == sizeof(KeepAliveMsg)) {
-     // --- Keep-Alive Nachricht empfangen ---
-     KeepAliveMsg receivedMsg;
-     memcpy(&receivedMsg, incomingData, sizeof(receivedMsg));
+	GenericMessage* msg = (GenericMessage*) incomingData;
 
-     if (isMaster) {
-        // Master empfängt PONG vom Slave
-        // Wir speichern die Zeit des letzten PONGs von IRGENDEINEM Slave
-        if (receivedMsg.type == PONG) {
-           char macStr[18];
-           // Verwende recv_info->src_addr für die MAC-Adresse des Senders
-           snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X", recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2], recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
-           WebSerial.printf("KeepAlive: PONG empfangen von %s.\n", macStr);
-           lastPongReceivedTime = millis(); // Zeit des letzten PONG aktualisieren (global)
-           connectionOk = true; // Verbindung ist OK (mindestens einer antwortet)
-        } // PING Nachrichten vom Master werden ignoriert (sollten nicht vorkommen)
-     } else {
-        // Slave empfängt PING vom Master
-        if (receivedMsg.type == PING) {
-           WebSerial.println("KeepAlive: PING empfangen.");
-           // PONG Zuruecksenden (F() Makro nicht nötig für println ohne Argument)
-           KeepAliveMsg pongMsg = {PING};
-           // Slave sendet Pong an die MAC des Masters (die in mac_addr steht)
-           // Wichtig: Der Master muss als Peer beim Slave registriert sein! Sende an recv_info->src_addr
-           esp_err_t result = esp_now_send(recv_info->src_addr, (uint8_t *) &pongMsg, sizeof(pongMsg));
-           WebSerial.print(F("KeepAlive: Sende PONG -> ")); WebSerial.println(result == ESP_OK ? F("OK") : F("Fehler"));
+if (isMaster && msg->type == PAIRING_REQUEST && len == sizeof(PairingMessage)) {
+      PairingMessage* pairMsg = (PairingMessage*) incomingData;
+      WebSerial.print(F("Master: Kopplungsanfrage empfangen von: "));
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+               pairMsg->macAddr[0], pairMsg->macAddr[1], pairMsg->macAddr[2], pairMsg->macAddr[3], pairMsg->macAddr[4], pairMsg->macAddr[5]);
+      WebSerial.println(macStr);
 
-           // Empfangszeit und Status aktualisieren (F() Makro nicht nötig für println ohne Argument)
-           lastMessageReceivedTime = millis();
-           connectionOk = true; // Verbindung ist offensichtlich OK
-        } // PONG Nachrichten vom Master werden ignoriert (sollten nicht vorkommen)
-     }
+      // Prüfen, ob der Peer bereits registriert ist
+      bool alreadyExists = false;
+      for (int i = 0; i < numRegisteredSlaves; i++) {
+        if (memcmp(slaveMacs[i], pairMsg->macAddr, 6) == 0) {
+          alreadyExists = true;
+          break;
+        }
+      }
 
-  } else if (len == sizeof(AmpelState)) {
+      if (!alreadyExists) {
+        if (numRegisteredSlaves < MAX_SLAVES) {
+          // Neuen Slave zur Liste hinzufügen
+          memcpy(slaveMacs[numRegisteredSlaves], pairMsg->macAddr, 6);
+          
+          WebSerial.println(F("Neuer Slave wird hinzugefügt und gespeichert."));
+          savePeerMacsToEEPROM(); // Neue Liste im EEPROM speichern [cite: 83]
+          updateEspNowPeers();    // ESP-NOW Peer-Liste aktualisieren [cite: 70]
+
+        } else {
+          WebSerial.println(F("Maximale Anzahl an Slaves bereits erreicht!"));
+        }
+      } else {
+        WebSerial.println(F("Slave ist bereits bekannt."));
+      }
+
+  } else if (!isMaster && msg->type == STATE_UPDATE && len == sizeof(AmpelStateMessage)) {
     // --- AmpelState Nachricht empfangen (nur Slave) ---
     if (isMaster) return; // Master ignoriert AmpelState Nachrichten
 
@@ -1294,6 +1357,18 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     bool receivedIsStartingGroupAB = currentStateData.isStartingGroupAB;
     uint8_t receivedShootingTimeIndex = currentStateData.shootingTimeIndex;
     uint8_t receivedTargetModeIndex = currentStateData.targetModeIndex;
+
+  // -- NEU: Keep-Alive Logik für den Slave --
+  else if (!isMaster && msg->type == PING && len == sizeof(KeepAliveMsg)) {
+      lastMessageReceivedTime = millis(); // PING zählt auch als empfangene Nachricht
+      connectionOk = true;
+
+      WebSerial.println(F("Slave: PING empfangen, sende PONG zurück an Master."));
+
+      // PONG Nachricht erstellen und an den Absender (Master) zurücksenden
+      KeepAliveMsg pongMsg = {PONG};
+      esp_now_send(recv_info->src_addr, (uint8_t *) &pongMsg, sizeof(pongMsg));
+  }
 
     // Aktualisiere lokale Variablen IMMER, wenn Daten empfangen
     currentState = receivedState;
@@ -1317,6 +1392,18 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     WebSerial.print(F(" SchiesszeitIdx: ")); WebSerial.print(currentShootingTimeIndex);
     WebSerial.print(F(" ZielmodusIdx: ")); WebSerial.print(currentTargetModeIndex);
     WebSerial.print(F(" Startgruppe AB?: ")); WebSerial.println(isStartingGroupAB);
+
+// -- NEU: Keep-Alive Logik für den Master --
+  else if (isMaster && msg->type == PONG && len == sizeof(KeepAliveMsg)) {
+      lastPongReceivedTime = millis(); // Zeit des letzten PONGs aktualisieren
+      connectionOk = true;
+
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+               recv_info->src_addr[0], recv_info->src_addr[1], recv_info->src_addr[2], 
+               recv_info->src_addr[3], recv_info->src_addr[4], recv_info->src_addr[5]);
+      WebSerial.printf("Master: PONG empfangen von %s\n", macStr);
+  }
 
     // Notfall-Behandlung im Slave
     if (receivedToneType == TONE_EMERGENCY) {
